@@ -14,72 +14,6 @@ const readCSV = async (filePath) => {
   });
 };
 
-// Create optimized data structures for lookups
-const createDataStructures = (games, packages, offers) => {
-  // Create hash maps for quick lookups
-  const gamesMap = new Map();
-  const packagesMap = new Map();
-  const offersByGame = new Map();
-  const offersByPackage = new Map();
-  const gamesByTeam = new Map();
-
-  // Index games
-  games.forEach(game => {
-    const gameId = parseInt(game.id);
-    gamesMap.set(gameId, game);
-    
-    // Index games by team
-    [game.team_home, game.team_away].forEach(team => {
-      if (!gamesByTeam.has(team)) {
-        gamesByTeam.set(team, new Set());
-      }
-      gamesByTeam.get(team).add(gameId);
-    });
-  });
-
-  // Index packages
-  packages.forEach(pkg => {
-    const packageId = parseInt(pkg.id);
-    packagesMap.set(packageId, {
-      ...pkg,
-      monthlyPrice: parseInt(pkg.monthly_price_cents) / 100,
-      yearlyPrice: parseInt(pkg.monthly_price_yearly_subscription_in_cents) / 100
-    });
-  });
-
-  // Index offers
-  offers.forEach(offer => {
-    const gameId = parseInt(offer.game_id);
-    const packageId = parseInt(offer.streaming_package_id);
-    const offerData = {
-      gameId,
-      packageId,
-      live: offer.live === "1",
-      highlights: offer.highlights === "1"
-    };
-
-    // Index by game
-    if (!offersByGame.has(gameId)) {
-      offersByGame.set(gameId, new Set());
-    }
-    offersByGame.get(gameId).add(offerData);
-
-    // Index by package
-    if (!offersByPackage.has(packageId)) {
-      offersByPackage.set(packageId, new Set());
-    }
-    offersByPackage.get(packageId).add(offerData);
-  });
-
-  return {
-    gamesMap,
-    packagesMap,
-    offersByGame,
-    offersByPackage,
-    gamesByTeam
-  };
-};
-
 export const calculatePackageRankings = async (selectedTeams) => {
   // Read data from CSV files
   const [games, packages, offers] = await Promise.all([
@@ -88,61 +22,57 @@ export const calculatePackageRankings = async (selectedTeams) => {
     readCSV('/csv/bc_streaming_offer.csv')
   ]);
 
-  // Create optimized data structures
-  const {
-    gamesMap,
-    packagesMap,
-    offersByGame,
-    offersByPackage,
-    gamesByTeam
-  } = createDataStructures(games, packages, offers);
-
-  // Get all games for selected teams using the inverted index
-  const teamGamesIds = new Set();
-  selectedTeams.forEach(team => {
-    const teamGames = gamesByTeam.get(team.name);
-    if (teamGames) {
-      teamGames.forEach(gameId => teamGamesIds.add(gameId));
-    }
-  });
+  // Get all games for selected teams
+  const teamGames = games.filter(game => 
+    selectedTeams.some(team => 
+      game.team_home === team.name || game.team_away === team.name
+    )
+  );
 
   // Calculate coverage for each package
-  const packageStats = Array.from(packagesMap.values()).map(pkg => {
-    const packageOffers = offersByPackage.get(pkg.id) || new Set();
-    
-    // Count games covered by this package
-    const coveredGames = new Set();
-    const liveGames = new Set();
-    const onDemandGames = new Set();
+  const packageStats = packages.map(pkg => {
+    const packageOffers = offers.filter(offer => 
+      parseInt(offer.streaming_package_id) === parseInt(pkg.id)
+    );
 
-    packageOffers.forEach(offer => {
-      if (teamGamesIds.has(offer.gameId)) {
-        if (offer.live || offer.highlights) {
-          coveredGames.add(offer.gameId);
-        }
-        if (offer.live) {
-          liveGames.add(offer.gameId);
-        }
-        if (offer.highlights) {
-          onDemandGames.add(offer.gameId);
-        }
-      }
-    });
+    const coveredGames = teamGames.filter(game =>
+      packageOffers.some(offer => 
+        parseInt(offer.game_id) === parseInt(game.id) && 
+        (offer.live === "1" || offer.highlights === "1")
+      )
+    );
 
-    const coverage = teamGamesIds.size > 0 
-      ? (coveredGames.size / teamGamesIds.size) * 100 
+    const liveGames = teamGames.filter(game =>
+      packageOffers.some(offer => 
+        parseInt(offer.game_id) === parseInt(game.id) && 
+        offer.live === "1"
+      )
+    );
+
+    const onDemandGames = teamGames.filter(game =>
+      packageOffers.some(offer => 
+        parseInt(offer.game_id) === parseInt(game.id) && 
+        offer.highlights === "1"
+      )
+    );
+
+    const coverage = teamGames.length > 0 
+      ? (coveredGames.length / teamGames.length) * 100 
       : 0;
+
+    const monthlyPrice = parseInt(pkg.monthly_price_cents) / 100;
+    const yearlyPrice = parseInt(pkg.monthly_price_yearly_subscription_in_cents) / 100;
     
     return {
-      id: pkg.id,
+      id: parseInt(pkg.id),
       name: pkg.name,
-      monthlyPrice: pkg.monthlyPrice,
-      yearlyPrice: pkg.yearlyPrice,
+      monthlyPrice,
+      yearlyPrice,
       coverage,
-      totalGames: coveredGames.size,
-      liveGames: liveGames.size,
-      onDemandGames: onDemandGames.size,
-      gamesPerEuro: pkg.yearlyPrice > 0 ? coveredGames.size / pkg.yearlyPrice : coveredGames.size,
+      totalGames: coveredGames.length,
+      liveGames: liveGames.length,
+      onDemandGames: onDemandGames.length,
+      gamesPerEuro: yearlyPrice > 0 ? coveredGames.length / yearlyPrice : coveredGames.length,
     };
   });
 
@@ -154,23 +84,23 @@ export const calculatePackageRankings = async (selectedTeams) => {
     return b.coverage - a.coverage;
   });
 
-  // Find best combinations for maximum coverage
-  const bestCombinations = findBestCombinations(packageStats, teamGamesIds.size, offersByPackage, teamGamesIds);
+  // Find best combinations for 100% coverage
+  const bestCombinations = findBestCombinations(packageStats, teamGames, offers);
 
   return {
     packages: rankedPackages,
     combinations: bestCombinations,
-    totalGames: teamGamesIds.size,
+    totalGames: teamGames.length,
   };
 };
 
-const findBestCombinations = (packageStats, totalGames, offersByPackage, teamGamesIds) => {
+const findBestCombinations = (packageStats, teamGames, offers) => {
   const combinations = [];
   const maxCombinationSize = 3; // Limit to 3 packages max for performance
 
   // Try different combination sizes
   for (let size = 1; size <= maxCombinationSize; size++) {
-    const combo = findBestCombinationOfSize(packageStats, totalGames, offersByPackage, teamGamesIds, size);
+    const combo = findBestCombinationOfSize(packageStats, teamGames, offers, size);
     if (combo) {
       combinations.push(combo);
     }
@@ -179,7 +109,7 @@ const findBestCombinations = (packageStats, totalGames, offersByPackage, teamGam
   return combinations.sort((a, b) => b.coverage - a.coverage);
 };
 
-const findBestCombinationOfSize = (packageStats, totalGames, offersByPackage, teamGamesIds, size) => {
+const findBestCombinationOfSize = (packageStats, teamGames, offers, size) => {
   const packages = packageStats.filter(pkg => pkg.coverage > 0);
   let bestCombo = null;
   let bestCoverage = 0;
@@ -200,22 +130,24 @@ const findBestCombinationOfSize = (packageStats, totalGames, offersByPackage, te
   const possibleCombos = getCombinations(packages, size);
 
   possibleCombos.forEach(combo => {
-    // Calculate combined coverage using Set operations
+    // Calculate combined coverage
     const coveredGames = new Set();
     let totalPrice = 0;
 
     combo.forEach(pkg => {
-      const packageOffers = offersByPackage.get(pkg.id) || new Set();
-      packageOffers.forEach(offer => {
-        if (teamGamesIds.has(offer.gameId) && (offer.live || offer.highlights)) {
-          coveredGames.add(offer.gameId);
-        }
-      });
+      const packageGames = teamGames.filter(game =>
+        offers.some(offer =>
+          parseInt(offer.streaming_package_id) === pkg.id &&
+          parseInt(offer.game_id) === parseInt(game.id) &&
+          (offer.live === "1" || offer.highlights === "1")
+        )
+      );
+      packageGames.forEach(game => coveredGames.add(game.id));
       totalPrice += pkg.yearlyPrice;
     });
 
-    const coverage = totalGames > 0 
-      ? (coveredGames.size / totalGames) * 100
+    const coverage = teamGames.length > 0 
+      ? (coveredGames.size / teamGames.length) * 100
       : 0;
 
     if (coverage > bestCoverage || (coverage === bestCoverage && totalPrice < bestPrice)) {
